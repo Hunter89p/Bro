@@ -36,10 +36,40 @@ ADMIN_ROLE_ID = CONFIG["bot"]["admin_role_id"]
 CURRENCY = CONFIG["economy"]["currency_symbol"]
 VPS_PLANS = CONFIG["vps_plans"]
 
+# AFK Voice Rewards Settings
+AFK_COINS_PER_MIN = CONFIG.get("afk_rewards", {}).get("coins_per_minute", 1)
+
+LICENSE_KEY = CONFIG["license"]["key"]
+VALID_LICENSES = CONFIG["license"]["valid_licenses"]
+
+
+# --- LICENSE VERIFICATION ---
+def verify_license():
+    """Validate software license on boot"""
+    print(f"🔒 Validating {BOT_NAME} License Key...")
+    if LICENSE_KEY not in VALID_LICENSES:
+        print("❌ CRITICAL ERROR: Invalid or missing license key!")
+        print("⛔ Unauthorized software copy. System shutting down...")
+        sys.exit(1)
+
+    lic_info = VALID_LICENSES[LICENSE_KEY]
+    if not lic_info.get("active", False):
+        print("❌ CRITICAL ERROR: Your license has been revoked or suspended!")
+        sys.exit(1)
+
+    print(
+        f"✅ LICENSE VERIFIED | Owner: {lic_info['owner']} | Tier:"
+        f" {lic_info['tier']}"
+    )
+
+
+verify_license()
+
 # File & Bot Settings
 TOKEN = os.getenv("DISCORD_TOKEN")
 VPS_STORAGE_FILE = "vps_data.json"
 ECONOMY_STORAGE_FILE = "economy_data.json"
+AFK_STORAGE_FILE = "afk_data.json"
 
 
 # Custom Bot Instance with Anti-Spam Command Protection
@@ -67,6 +97,7 @@ class CustomBot(commands.Bot):
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True
 
 bot = CustomBot(command_prefix=COMMAND_PREFIX, intents=intents)
 
@@ -80,11 +111,12 @@ except Exception as e:
 # In-Memory Storage Containers
 vps_data = {}
 economy_data = {}
+afk_data = {}
 
 
 # --- PERSISTENCE STORAGE FUNCTIONS ---
 def load_all_data():
-    global vps_data, economy_data
+    global vps_data, economy_data, afk_data
     if os.path.exists(VPS_STORAGE_FILE):
         with open(VPS_STORAGE_FILE, "r") as f:
             vps_data = json.load(f)
@@ -92,6 +124,10 @@ def load_all_data():
     if os.path.exists(ECONOMY_STORAGE_FILE):
         with open(ECONOMY_STORAGE_FILE, "r") as f:
             economy_data = json.load(f)
+
+    if os.path.exists(AFK_STORAGE_FILE):
+        with open(AFK_STORAGE_FILE, "r") as f:
+            afk_data = json.load(f)
 
 
 def save_vps_data():
@@ -102,6 +138,11 @@ def save_vps_data():
 def save_economy_data():
     with open(ECONOMY_STORAGE_FILE, "w") as f:
         json.dump(economy_data, f, indent=4)
+
+
+def save_afk_data():
+    with open(AFK_STORAGE_FILE, "w") as f:
+        json.dump(afk_data, f, indent=4)
 
 
 # --- ECONOMY HELPER FUNCTIONS ---
@@ -202,6 +243,114 @@ async def on_ready():
             await guild.me.edit(nick=BOT_NAME)
         except Exception as e:
             print(f"Could not change nickname in {guild.name}: {e}")
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    author_id = str(message.author.id)
+    is_afk_command = message.content.strip().startswith(
+        f"{COMMAND_PREFIX}afk"
+    )
+
+    # 1. Remove AFK status & Process Voice Channel Minutes
+    if author_id in afk_data and not is_afk_command:
+        info = afk_data[author_id]
+        start_time = info.get("timestamp", int(time.time()))
+        now = int(time.time())
+        elapsed_seconds = now - start_time
+        elapsed_minutes = elapsed_seconds // 60
+
+        reward_coins = 0
+        in_vc = message.author.voice and message.author.voice.channel
+
+        # Reward calculate strictly if user was in VC
+        if in_vc and elapsed_minutes >= 1:
+            reward_coins = int(elapsed_minutes * AFK_COINS_PER_MIN)
+            add_balance(author_id, reward_coins)
+
+        del afk_data[author_id]
+        save_afk_data()
+
+        msg = f"👋 Welcome back {message.author.mention}! Your AFK status has been removed."
+        if reward_coins > 0:
+            msg += f"\n🎙️ **Voice Reward:** Earned **{CURRENCY}{reward_coins}** coins for spending **{int(elapsed_minutes)} min(s)** AFK in VC!"
+        elif not in_vc and elapsed_minutes >= 1:
+            msg += "\n⚠️ *No AFK coins awarded because you were not in a Voice Channel (VC).* "
+
+        await message.channel.send(msg)
+
+    # 2. Check if a mentioned user is AFK
+    if message.mentions:
+        for user in message.mentions:
+            user_id = str(user.id)
+            if user_id in afk_data and user_id != author_id:
+                info = afk_data[user_id]
+                reason = info.get("reason", "AFK")
+                ts = info.get("timestamp", int(time.time()))
+                await message.channel.send(
+                    f"💤 **{user.display_name}** is currently AFK: **{reason}**"
+                    f" (<t:{ts}:R>)"
+                )
+
+    await bot.process_commands(message)
+
+
+# --- LICENSE COMMAND ---
+@bot.command(name="license_info")
+@commands.check(has_admin_role)
+async def license_info_cmd(ctx):
+    """Check active software license information"""
+    info = VALID_LICENSES.get(LICENSE_KEY, {})
+    embed = discord.Embed(
+        title=f"🔑 {BOT_NAME} License Details", color=discord.Color.blue()
+    )
+    embed.add_field(
+        name="License Key", value=f"`{LICENSE_KEY}`", inline=False
+    )
+    embed.add_field(
+        name="Registered Owner",
+        value=info.get("owner", "Unknown"),
+        inline=True,
+    )
+    embed.add_field(
+        name="License Tier", value=info.get("tier", "Unknown"), inline=True
+    )
+    embed.add_field(
+        name="Status",
+        value="🟢 Active" if info.get("active") else "🔴 Inactive",
+        inline=True,
+    )
+    embed.add_field(
+        name="Expires On", value=info.get("expires", "N/A"), inline=True
+    )
+    await ctx.send(embed=embed)
+
+
+# --- AFK COMMAND ---
+@bot.command(name="afk")
+async def afk_cmd(ctx, *, reason: str = "AFK"):
+    """Set AFK status (Voice Channel required to earn per-minute coins)"""
+    user_id = str(ctx.author.id)
+    afk_data[user_id] = {
+        "reason": reason,
+        "timestamp": int(time.time())
+    }
+    save_afk_data()
+
+    vc_status = (
+        "🎙️ **VC Active:** Earning **"
+        + f"{CURRENCY}{AFK_COINS_PER_MIN}** coin(s)/minute while in Voice!"
+        if ctx.author.voice and ctx.author.voice.channel
+        else "⚠️ **VC Inactive:** Join a Voice Channel to earn per-minute AFK"
+        " coins!"
+    )
+
+    await ctx.send(
+        f"💤 {ctx.author.mention}, I set your AFK status to: **{reason}**.\n{vc_status}"
+    )
 
 
 # --- ECONOMY COMMANDS ---
