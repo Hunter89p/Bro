@@ -176,8 +176,22 @@ def generate_vps_id():
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 
+def is_admin_check(author):
+    return any(role.id == ADMIN_ROLE_ID for role in getattr(author, "roles", []))
+
+
 def has_admin_role(ctx):
-    return any(role.id == ADMIN_ROLE_ID for role in ctx.author.roles)
+    return is_admin_check(ctx.author)
+
+
+def find_vps_by_id_or_token(query):
+    query = query.strip()
+    if query in vps_data:
+        return query, vps_data[query]
+    for token, details in vps_data.items():
+        if details.get("vps_id", "").upper() == query.upper():
+            return token, details
+    return None, None
 
 
 async def capture_ssh_session_line(process):
@@ -255,7 +269,6 @@ async def on_message(message):
         f"{COMMAND_PREFIX}afk"
     )
 
-    # 1. Remove AFK status & Process Voice Channel Minutes
     if author_id in afk_data and not is_afk_command:
         info = afk_data[author_id]
         start_time = info.get("timestamp", int(time.time()))
@@ -266,7 +279,6 @@ async def on_message(message):
         reward_coins = 0
         in_vc = message.author.voice and message.author.voice.channel
 
-        # Reward calculate strictly if user was in VC
         if in_vc and elapsed_minutes >= 1:
             reward_coins = int(elapsed_minutes * AFK_COINS_PER_MIN)
             add_balance(author_id, reward_coins)
@@ -282,7 +294,6 @@ async def on_message(message):
 
         await message.channel.send(msg)
 
-    # 2. Check if a mentioned user is AFK
     if message.mentions:
         for user in message.mentions:
             user_id = str(user.id)
@@ -494,7 +505,6 @@ async def buy_vps_cmd(ctx, plan_name: str):
         memory_bytes = plan["ram_gb"] * 1024 * 1024 * 1024
         docker_cfg = CONFIG["docker"]
 
-        # Spin up Docker container with KVM and Dedicated Hardware Isolation
         container = client.containers.run(
             docker_cfg["default_image"],
             detach=True,
@@ -571,7 +581,7 @@ async def buy_vps_cmd(ctx, plan_name: str):
             await status_msg.edit(
                 content=(
                     f"✅ Dedicated KVM VPS (**{plan_key.upper()}**) purchased"
-                    " successfully! Credentials sent to your DMs."
+                    f" successfully! Credentials sent to your DMs."
                 )
             )
         except discord.Forbidden:
@@ -590,6 +600,363 @@ async def buy_vps_cmd(ctx, plan_name: str):
                 f" **{CURRENCY}{cost}**."
             )
         )
+
+
+# --- PROFESSIONAL VPS MANAGEMENT CONTROL PANEL (!manage) ---
+@bot.group(name="manage", invoke_without_command=True)
+async def manage_group(ctx):
+    """Professional VPS Control Dashboard"""
+    embed = discord.Embed(
+        title=f"🛠️ {BOT_NAME} - Professional VPS Control Panel",
+        description="Manage your dedicated KVM server instances effortlessly.",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(
+        name="📋 Commands Overview",
+        value=(
+            f"`{COMMAND_PREFIX}manage list` - List your active VPS instances\n"
+            f"`{COMMAND_PREFIX}manage info <vps_id>` - View status & hardware specs\n"
+            f"`{COMMAND_PREFIX}manage start` / `on <vps_id>` - Power ON your VPS\n"
+            f"`{COMMAND_PREFIX}manage stop` / `off <vps_id>` - Power OFF your VPS\n"
+            f"`{COMMAND_PREFIX}manage restart <vps_id>` - Reboot your VPS\n"
+            f"`{COMMAND_PREFIX}manage reinstall <vps_id>` - Reinstall clean OS & reset VPS\n"
+            f"`{COMMAND_PREFIX}manage ssh <vps_id>` - Re-send SSH credentials to DM\n"
+            f"`{COMMAND_PREFIX}manage delete <vps_id>` - Destroy your VPS instance"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Use your VPS ID or Token with management commands.")
+    await ctx.send(embed=embed)
+
+
+# --- LIST COMMAND ---
+@manage_group.command(name="list")
+async def manage_list(ctx):
+    """List user's active VPS instances"""
+    user_id = str(ctx.author.id)
+    admin = is_admin_check(ctx.author)
+
+    user_vps = []
+    for token, info in vps_data.items():
+        if info.get("created_by") == user_id or admin:
+            user_vps.append((token, info))
+
+    if not user_vps:
+        await ctx.send("❌ You do not own any active VPS instances.")
+        return
+
+    embed = discord.Embed(
+        title="🖥️ Your Active VPS Instances",
+        color=discord.Color.dark_teal(),
+    )
+
+    for token, info in user_vps:
+        status_icon = "❓ Unknown"
+        if client:
+            try:
+                cnt = client.containers.get(info["container_id"])
+                status_icon = "🟢 Running" if cnt.status == "running" else f"🔴 {cnt.status.capitalize()}"
+            except Exception:
+                status_icon = "🔴 Stopped / Removed"
+
+        owner_str = f" | Owner: <@{info.get('created_by')}>" if admin else ""
+        embed.add_field(
+            name=f"🆔 VPS ID: `{info['vps_id']}`",
+            value=(
+                f"• **Status:** {status_icon}\n"
+                f"• **Specs:** {info.get('memory', '?')}GB RAM | {info.get('cpu', '?')} Cores | {info.get('disk', '?')}GB SSD\n"
+                f"• **Token:** `{token}`{owner_str}"
+            ),
+            inline=False,
+        )
+
+    await ctx.send(embed=embed)
+
+
+# --- INFO COMMAND ---
+@manage_group.command(name="info")
+async def manage_info(ctx, vps_id: str):
+    """Display detailed hardware and power status for a VPS"""
+    token, info = find_vps_by_id_or_token(vps_id)
+
+    if not info:
+        await ctx.send(f"❌ VPS with ID/Token `{vps_id}` not found.")
+        return
+
+    if info.get("created_by") != str(ctx.author.id) and not is_admin_check(ctx.author):
+        await ctx.send("❌ Permission denied! You do not own this VPS.")
+        return
+
+    status_str = "Unknown"
+    if client:
+        try:
+            cnt = client.containers.get(info["container_id"])
+            status_str = f"🟢 {cnt.status.upper()}" if cnt.status == "running" else f"🔴 {cnt.status.upper()}"
+        except Exception:
+            status_str = "🔴 STOPPED"
+
+    embed = discord.Embed(
+        title=f"📊 VPS Instance Detailed Info [{info['vps_id']}]",
+        color=discord.Color.blue(),
+    )
+    embed.add_field(name="🆔 VPS ID", value=f"`{info['vps_id']}`", inline=True)
+    embed.add_field(name="⚡ Status", value=status_str, inline=True)
+    embed.add_field(name="🖥️ Type", value=info.get("type", "KVM VPS"), inline=True)
+    embed.add_field(name="💾 RAM", value=f"{info.get('memory')} GB", inline=True)
+    embed.add_field(name="⚡ CPU", value=f"{info.get('cpu')} Cores", inline=True)
+    embed.add_field(name="💽 Disk", value=f"{info.get('disk')} GB SSD", inline=True)
+    embed.add_field(name="👤 Owner ID", value=f"`{info.get('created_by')}`", inline=True)
+    embed.add_field(name="📅 Created At", value=str(info.get("created_at")), inline=True)
+
+    await ctx.send(embed=embed)
+
+
+# --- POWER ON / START COMMANDS ---
+@manage_group.command(name="start", aliases=["on"])
+async def manage_start(ctx, vps_id: str):
+    """Power ON / Start a VPS instance"""
+    token, info = find_vps_by_id_or_token(vps_id)
+
+    if not info:
+        await ctx.send(f"❌ VPS with ID/Token `{vps_id}` not found.")
+        return
+
+    if info.get("created_by") != str(ctx.author.id) and not is_admin_check(ctx.author):
+        await ctx.send("❌ Permission denied!")
+        return
+
+    if not client:
+        await ctx.send("❌ Docker service is offline.")
+        return
+
+    msg = await ctx.send(f"🔄 Booting VPS `{info['vps_id']}`...")
+    try:
+        container = client.containers.get(info["container_id"])
+        if container.status == "running":
+            await msg.edit(content=f"⚠️ VPS `{info['vps_id']}` is already **RUNNING**!")
+            return
+
+        container.start()
+        await msg.edit(content=f"🟢 VPS `{info['vps_id']}` powered ON successfully!")
+    except Exception as e:
+        await msg.edit(content=f"❌ Failed to start VPS: {str(e)}")
+
+
+# --- POWER OFF / STOP COMMANDS ---
+@manage_group.command(name="stop", aliases=["off"])
+async def manage_stop(ctx, vps_id: str):
+    """Power OFF / Stop a running VPS instance"""
+    token, info = find_vps_by_id_or_token(vps_id)
+
+    if not info:
+        await ctx.send(f"❌ VPS with ID/Token `{vps_id}` not found.")
+        return
+
+    if info.get("created_by") != str(ctx.author.id) and not is_admin_check(ctx.author):
+        await ctx.send("❌ Permission denied!")
+        return
+
+    if not client:
+        await ctx.send("❌ Docker service is offline.")
+        return
+
+    msg = await ctx.send(f"🛑 Powering OFF VPS `{info['vps_id']}`...")
+    try:
+        container = client.containers.get(info["container_id"])
+        container.stop(timeout=10)
+        await msg.edit(content=f"🔴 VPS `{info['vps_id']}` has been powered OFF!")
+    except Exception as e:
+        await msg.edit(content=f"❌ Failed to stop VPS: {str(e)}")
+
+
+# --- RESTART COMMAND ---
+@manage_group.command(name="restart", aliases=["reboot"])
+async def manage_restart(ctx, vps_id: str):
+    """Reboot / Restart a VPS instance"""
+    token, info = find_vps_by_id_or_token(vps_id)
+
+    if not info:
+        await ctx.send(f"❌ VPS with ID/Token `{vps_id}` not found.")
+        return
+
+    if info.get("created_by") != str(ctx.author.id) and not is_admin_check(ctx.author):
+        await ctx.send("❌ Permission denied!")
+        return
+
+    if not client:
+        await ctx.send("❌ Docker service is offline.")
+        return
+
+    msg = await ctx.send(f"🔄 Rebooting VPS `{info['vps_id']}`...")
+    try:
+        container = client.containers.get(info["container_id"])
+        container.restart()
+        await msg.edit(content=f"🟢 VPS `{info['vps_id']}` restarted successfully!")
+    except Exception as e:
+        await msg.edit(content=f"❌ Failed to restart VPS: {str(e)}")
+
+
+# --- REINSTALL / RESET OS COMMAND ---
+@manage_group.command(name="reinstall", aliases=["reset", "rebuild"])
+async def manage_reinstall(ctx, vps_id: str):
+    """Wipe and reinstall a fresh OS/environment on the VPS"""
+    token, info = find_vps_by_id_or_token(vps_id)
+
+    if not info:
+        await ctx.send(f"❌ VPS with ID/Token `{vps_id}` not found.")
+        return
+
+    if info.get("created_by") != str(ctx.author.id) and not is_admin_check(ctx.author):
+        await ctx.send("❌ Permission denied!")
+        return
+
+    if not client:
+        await ctx.send("❌ Docker service is offline.")
+        return
+
+    msg = await ctx.send(f"🔄 **Reinstalling VPS `{info['vps_id']}`...** Wiping existing container...")
+
+    try:
+        # 1. Terminate and remove old container
+        try:
+            old_container = client.containers.get(info["container_id"])
+            old_container.stop(timeout=5)
+            old_container.remove(force=True)
+        except Exception as e:
+            print(f"Old container removal note: {e}")
+
+        # 2. Retrieve hardware allocations
+        ram_gb = info.get("memory", 2)
+        cpu_cores = info.get("cpu", 1)
+        memory_bytes = ram_gb * 1024 * 1024 * 1024
+        docker_cfg = CONFIG["docker"]
+
+        # 3. Spin up fresh environment
+        new_container = client.containers.run(
+            docker_cfg["default_image"],
+            detach=True,
+            hostname=f"{docker_cfg['hostname_prefix']}-{info['vps_id'].lower()}",
+            mem_limit=memory_bytes,
+            mem_reservation=memory_bytes if docker_cfg["dedicated_resources"] else None,
+            mem_swappiness=0 if docker_cfg["dedicated_resources"] else None,
+            cpu_period=100000,
+            cpu_quota=int(cpu_cores * 100000),
+            devices=docker_cfg["devices"] if docker_cfg["enable_kvm"] else None,
+            cap_add=docker_cfg["capabilities"],
+            security_opt=["seccomp=unconfined"],
+            command="tail -f /dev/null",
+            tty=True,
+        )
+
+        await msg.edit(content=f"⚙️ Provisioning fresh OS and packages for `{info['vps_id']}`...")
+        await asyncio.sleep(3)
+
+        if not await setup_container(new_container.id, msg):
+            raise Exception("Failed to configure container packages.")
+
+        exec_cmd = await asyncio.create_subprocess_exec(
+            "docker",
+            "exec",
+            new_container.id,
+            "tmate",
+            "-F",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        ssh_session_line = await capture_ssh_session_line(exec_cmd)
+
+        # 4. Save updated container info
+        info["container_id"] = new_container.id
+        info["tmate_session"] = ssh_session_line or "Session pending..."
+        vps_data[token] = info
+        save_vps_data()
+
+        embed = discord.Embed(
+            title=f"🔄 VPS Reinstalled Successfully [{info['vps_id']}]",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="🆔 VPS ID", value=f"`{info['vps_id']}`", inline=True)
+        embed.add_field(name="🔑 Connection Token", value=f"`{token}`", inline=True)
+        if ssh_session_line:
+            embed.add_field(
+                name="🔒 New SSH / Tmate Session",
+                value=f"```{ssh_session_line}```",
+                inline=False,
+            )
+
+        try:
+            await ctx.author.send(embed=embed)
+            await msg.edit(content=f"✅ VPS `{info['vps_id']}` has been reinstalled! New SSH credentials sent to your DMs.")
+        except discord.Forbidden:
+            await msg.edit(content=f"✅ VPS `{info['vps_id']}` reinstalled! Direct message blocked, enable DMs to view SSH details.")
+
+    except Exception as e:
+        await msg.edit(content=f"❌ Reinstall failed: {str(e)}")
+
+
+# --- SSH COMMAND ---
+@manage_group.command(name="ssh")
+async def manage_ssh(ctx, vps_id: str):
+    """Fetch and DM active SSH / Tmate credentials"""
+    token, info = find_vps_by_id_or_token(vps_id)
+
+    if not info:
+        await ctx.send(f"❌ VPS with ID/Token `{vps_id}` not found.")
+        return
+
+    if info.get("created_by") != str(ctx.author.id) and not is_admin_check(ctx.author):
+        await ctx.send("❌ Permission denied!")
+        return
+
+    session_info = info.get("tmate_session", "No active session recorded.")
+
+    embed = discord.Embed(
+        title=f"🔑 VPS Session Details [{info['vps_id']}]",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="🆔 VPS ID", value=f"`{info['vps_id']}`", inline=True)
+    embed.add_field(name="🔑 Connection Token", value=f"`{token}`", inline=True)
+    embed.add_field(
+        name="🔒 SSH / Tmate Command",
+        value=f"```{session_info}```",
+        inline=False,
+    )
+
+    try:
+        await ctx.author.send(embed=embed)
+        await ctx.send(f"✅ Active SSH credentials sent to your DMs for VPS `{info['vps_id']}`.")
+    except discord.Forbidden:
+        await ctx.send("❌ Direct message blocked! Please enable server DMs to receive credentials.")
+
+
+# --- DELETE COMMAND ---
+@manage_group.command(name="delete", aliases=["destroy"])
+async def manage_delete(ctx, vps_id: str):
+    """Permanently delete and erase a VPS instance"""
+    token, info = find_vps_by_id_or_token(vps_id)
+
+    if not info:
+        await ctx.send(f"❌ VPS with ID/Token `{vps_id}` not found.")
+        return
+
+    if info.get("created_by") != str(ctx.author.id) and not is_admin_check(ctx.author):
+        await ctx.send("❌ Permission denied!")
+        return
+
+    msg = await ctx.send(f"⚠️ Terminating & destroying VPS `{info['vps_id']}`...")
+
+    if client:
+        try:
+            container = client.containers.get(info["container_id"])
+            container.stop(timeout=5)
+            container.remove(force=True)
+        except Exception as e:
+            print(f"Error deleting Docker container: {e}")
+
+    del vps_data[token]
+    save_vps_data()
+
+    await msg.edit(content=f"🗑️ VPS `{info['vps_id']}` has been permanently destroyed.")
 
 
 @bot.event
